@@ -1,0 +1,219 @@
+# Save as: .github/workflows/release-armv7-termux.yml
+# Builds an ARMv7 (32-bit ARM) Android/Termux executable. Auto-detects Go or Rust.
+name: Build & Release ARMv7 Termux
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  NTFY_URL: https://ntfy.sh/az_alerts
+  CARGO_TERM_COLOR: never
+
+jobs:
+  armv7-termux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ------------------------------------------------------------ detect
+      - name: Detect project type and tag
+        id: d
+        run: |
+          LANG_FOUND="none"
+          if [ -f Cargo.toml ]; then
+            LANG_FOUND="rust"
+          elif [ -f go.mod ]; then
+            LANG_FOUND="go"
+          elif [ -n "$(find . -name '*.go' -not -path './vendor/*' -print -quit)" ]; then
+            LANG_FOUND="go"
+          fi
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG="${{ github.ref_name }}"
+          else
+            TAG="armv7-build-${{ github.run_number }}"
+          fi
+          NAME="${{ github.event.repository.name }}"
+          APP="${NAME//[^A-Za-z0-9._-]/-}"
+          echo "lang=$LANG_FOUND" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "app=$APP" >> "$GITHUB_OUTPUT"
+          echo "Detected: $LANG_FOUND, tag: $TAG"
+
+      - name: Notify start
+        continue-on-error: true
+        run: |
+          curl -fsS --max-time 15 \
+            -H "Title: ARMv7 Termux build started" \
+            -H "Tags: hammer_and_wrench" \
+            -H "Click: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -d "${{ github.repository }} @ ${GITHUB_SHA::7} (${{ steps.d.outputs.lang }}). Tag: ${{ steps.d.outputs.tag }}" \
+            "$NTFY_URL" || true
+
+      # ------------------------------------------------------------- tools
+      - uses: actions/setup-go@v5
+        if: steps.d.outputs.lang == 'go'
+        continue-on-error: true
+        with:
+          go-version: stable
+          cache: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.d.outputs.lang == 'rust'
+        continue-on-error: true
+        with:
+          targets: armv7-linux-androideabi
+
+      - name: Check preinstalled Android NDK
+        id: ndkcheck
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}}"
+          if [ -n "$NDK" ] && [ -d "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" ]; then
+            echo "have=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Android NDK (only if missing)
+        if: steps.ndkcheck.outputs.have != 'true'
+        continue-on-error: true
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+          add-to-path: false
+
+      # ------------------------------------------------------------- build
+      - name: Build ARMv7 Android binary
+        id: build
+        continue-on-error: true
+        env:
+          APP: ${{ steps.d.outputs.app }}
+          LANGKIND: ${{ steps.d.outputs.lang }}
+        run: |
+          set -u
+          [ "$LANGKIND" != "none" ] || { echo "No Go or Rust project found"; exit 1; }
+
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}}"
+          [ -d "$NDK" ] || { echo "Android NDK not found"; exit 1; }
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+          # API 21 = runs on Android 5.0+ (covers kernel 4.14 devices easily)
+          CC_PATH="$BIN/armv7a-linux-androideabi21-clang"
+          if [ ! -x "$CC_PATH" ]; then
+            CC_PATH="$(ls "$BIN"/armv7a-linux-androideabi*-clang 2>/dev/null | sort | head -n1 || true)"
+          fi
+          [ -n "$CC_PATH" ] && [ -x "$CC_PATH" ] || { echo "NDK armv7a clang not found"; exit 1; }
+          echo "Using compiler: $CC_PATH"
+
+          mkdir -p dist outbin
+          OUTNAMES=""
+
+          if [ "$LANGKIND" = "go" ]; then
+            [ -f go.mod ] || go mod init "github.com/${{ github.repository }}"
+            go mod tidy || true
+
+            PKG="."
+            ROOT_NAME="$(go list -f '{{.Name}}' . 2>/dev/null || true)"
+            if [ "$ROOT_NAME" != "main" ]; then
+              ALL_MAINS="$(go list -f '{{if eq .Name "main"}}{{.ImportPath}}{{end}}' ./... 2>/dev/null || true)"
+              ALL_MAINS="$(echo "$ALL_MAINS" | sed '/^$/d')"
+              PKG="${ALL_MAINS%%$'\n'*}"
+            fi
+            [ -n "$PKG" ] || { echo "No main package found"; exit 1; }
+
+            export GOOS=android GOARCH=arm GOARM=7 CGO_ENABLED=1 CC="$CC_PATH"
+            go build -trimpath -buildmode=pie -ldflags "-s -w" -o "outbin/$APP" "$PKG" || exit 1
+            OUTNAMES="$APP"
+          else
+            BINS="$(cargo metadata --no-deps --format-version 1 | python3 -c "import sys,json; d=json.load(sys.stdin); print('\n'.join(t['name'] for p in d['packages'] for t in p['targets'] if 'bin' in t['kind']))")"
+            [ -n "$BINS" ] || { echo "No binary targets found"; exit 1; }
+            rustup target add armv7-linux-androideabi || exit 1
+            export CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER="$CC_PATH"
+            export CC_armv7_linux_androideabi="$CC_PATH"
+            export AR_armv7_linux_androideabi="$BIN/llvm-ar"
+            export CARGO_PROFILE_RELEASE_STRIP=true
+            cargo build --release --bins --target armv7-linux-androideabi || exit 1
+            for b in $BINS; do
+              src="target/armv7-linux-androideabi/release/$b"
+              [ -f "$src" ] && cp "$src" "outbin/$b" && OUTNAMES="$OUTNAMES $b"
+            done
+          fi
+
+          [ -n "$OUTNAMES" ] || { echo "No binaries produced"; exit 1; }
+          for b in $OUTNAMES; do
+            chmod +x "outbin/$b"
+            INFO="$(file "outbin/$b" || true)"
+            echo "$INFO"
+            case "$INFO" in
+              *ARM*) ;;
+              *) echo "Output is not an ARM binary"; exit 1 ;;
+            esac
+            tar -C outbin -czf "dist/$b-termux-armv7.tar.gz" "$b"
+          done
+          cd dist && sha256sum * > checksums.txt
+          ls -lh
+
+      - name: Notify build result
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ "${{ steps.build.outcome }}" = "success" ]; then
+            T="Built OK: termux-armv7"; TAGS="white_check_mark"
+          else
+            T="Build FAILED: termux-armv7"; TAGS="x"
+          fi
+          curl -fsS --max-time 15 \
+            -H "Title: $T" -H "Tags: $TAGS" \
+            -H "Click: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -d "${{ github.repository }} @ ${GITHUB_SHA::7}" \
+            "$NTFY_URL" || true
+
+      # ----------------------------------------------------------- release
+      - name: Publish release
+        if: steps.build.outcome == 'success'
+        id: rel
+        continue-on-error: true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.d.outputs.tag }}
+          name: ${{ steps.d.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          draft: false
+          prerelease: false
+          make_latest: false
+          fail_on_unmatched_files: false
+          files: dist/*
+          body: |
+            ## ARMv7 Android / Termux (32-bit ARM)
+            Download `*-termux-armv7.tar.gz`, then in Termux:
+            `tar -xzf <file>.tar.gz && ./<name>`
+
+      - name: Notify final result
+        if: always()
+        continue-on-error: true
+        run: |
+          BASE="${{ github.server_url }}/${{ github.repository }}"
+          TAG="${{ steps.d.outputs.tag }}"
+          if [ "${{ steps.build.outcome }}" != "success" ] || [ "${{ steps.rel.outcome }}" != "success" ]; then
+            curl -fsS --max-time 15 -H "Title: ARMv7 release FAILED" -H "Tags: rotating_light" \
+              -H "Click: $BASE/actions/runs/${{ github.run_id }}" \
+              -d "No release was published for ${{ github.repository }}. Check the logs." "$NTFY_URL" || true
+            exit 0
+          fi
+          MSG="Release $TAG is live!"$'\n'"Page: $BASE/releases/tag/$TAG"
+          for f in dist/*; do
+            n=$(basename "$f")
+            [ "$n" = "checksums.txt" ] && continue
+            MSG="$MSG"$'\n'"- $n: $BASE/releases/download/$TAG/$n"
+          done
+          curl -fsS --max-time 15 \
+            -H "Title: ARMv7 release ready: ${{ github.repository }}" \
+            -H "Tags: rocket,tada" \
+            -H "Click: $BASE/releases/tag/$TAG" \
+            -H "Actions: view, Open release, $BASE/releases/tag/$TAG" \
+            -d "$MSG" "$NTFY_URL" || true
