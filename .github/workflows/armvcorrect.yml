@@ -18,7 +18,7 @@ jobs:
   armv7-termux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # ------------------------------------------------------------ detect
       - name: Prepare tag and name
@@ -45,7 +45,7 @@ jobs:
             "$NTFY_URL" || true
 
       # ------------------------------------------------------------- tools
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         continue-on-error: true
         with:
           go-version: stable
@@ -191,7 +191,7 @@ jobs:
         if: steps.build.outcome == 'success'
         id: rel
         continue-on-error: true
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.d.outputs.tag }}
           name: ${{ steps.d.outputs.tag }}
